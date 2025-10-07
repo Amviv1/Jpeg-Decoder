@@ -301,9 +301,15 @@ function ReadFrame(Buff)
     end
 
     --initializing blocks
-    for p, c in pairs(ComponantsInfo) do
+    for p, c in pairs(ComponantsInfo) do 
+        --need to account for extra blocks from expanding caused by sampling factors (should be a multiple of the sampling factors)
         Blocks[p] = {}
-        local NumComponantBlocks = math.ceil(math.ceil(X / 8) * math.ceil(Y / 8) * ((c.HorizontalSamplingFactor * c.VerticalSamplingFactor) / (HMax * VMax)))
+        local BlocksXDim = math.ceil((math.ceil(X / 8) * (c.HorizontalSamplingFactor / HMax)) / c.HorizontalSamplingFactor) * c.HorizontalSamplingFactor
+        local BlocksYDim = math.ceil((math.ceil(Y / 8) *  (c.VerticalSamplingFactor / VMax)) / c.VerticalSamplingFactor) * c.VerticalSamplingFactor
+        Blocks[p].X = BlocksXDim
+        Blocks[p].Y = BlocksYDim
+
+        local NumComponantBlocks = BlocksXDim * BlocksYDim
         for i = 1, NumComponantBlocks, 1 do
             local Block = {}
             for v = 1, 64, 1 do
@@ -311,7 +317,6 @@ function ReadFrame(Buff)
             end
             Blocks[p][i] = Block
         end
-        -- print("Componant", p, "Blocks:", NumComponantBlocks, c.HorizontalSamplingFactor, c.VerticalSamplingFactor, GetTotalMCUs())
     end
 
     --initializing MCUs
@@ -355,24 +360,24 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
     local PreviousDCCoefficients = {}
     local TotalMCUs = GetTotalMCUs()
 
-    -- local HMax = 1
-    -- local VMax = 1
+    local ScanHMax = 1
+    local ScanVMax = 1
 
-    -- for i = 1, ComponantsInScan, 1 do
-    --     local ComponantParams = ComponantParameters[1]
-    --     local ComponantInfo = ComponantsInfo[ComponantParams.ScanComponantIndex]
-    --     if (ComponantInfo.HorizontalSamplingFactor > HMax) then
-    --         HMax = ComponantInfo.HorizontalSamplingFactor
-    --     end
+    for i = 1, ComponantsInScan, 1 do
+        local ComponantParams = ComponantParameters[1]
+        local ComponantInfo = ComponantsInfo[ComponantParams.ScanComponantIndex]
+        if (ComponantInfo.HorizontalSamplingFactor > ScanHMax) then
+            ScanHMax = ComponantInfo.HorizontalSamplingFactor
+        end
 
-    --     if (ComponantInfo.VerticalSamplingFactor > VMax) then
-    --         VMax = ComponantInfo.VerticalSamplingFactor
-    --     end
-    -- end
+        if (ComponantInfo.VerticalSamplingFactor > ScanVMax) then
+            ScanVMax = ComponantInfo.VerticalSamplingFactor
+        end
+    end
 
-    -- local MCUPerRow = math.ceil(X / (HMax * 8))
-    -- local MCUPerCol = math.ceil(Y / (VMax * 8))
-    -- TotalMCUs = MCUPerRow * MCUPerCol
+    local MCUXDim = math.ceil(X / (8 * ScanHMax))
+    local MCUYDim = math.ceil(Y / (8 * ScanVMax))
+    -- local TotalMCUs = MCUXDim * MCUYDim
 
     for i = 1, ComponantsInScan, 1 do
         PreviousDCCoefficients[i] = 0
@@ -398,9 +403,22 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                 os.exit(1)
             end
 
+            local Copy = {}
+
             for c = 1, NumComponantBlocks, 1 do
                 local BlockData = ComponantBlocks[c]
                 local K = Ss + 1
+
+                if (ComponantsInScan > 1) then
+                    local MCUYIndex = (MCU-1) // MCUXDim
+                    local MCUXIndex = (MCU-1) - MCUYIndex * MCUXDim
+                    local BlockY = MCUYIndex * ComponantInfo.VerticalSamplingFactor + (c-1) // ComponantInfo.HorizontalSamplingFactor
+                    local BlockX = MCUXIndex * ComponantInfo.HorizontalSamplingFactor + ((c-1) % ComponantInfo.HorizontalSamplingFactor) + 1
+                    local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
+                    Copy = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+                else
+                    Copy = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                end
 
                 if (EndOfBandRun == 0) then
 
@@ -438,6 +456,10 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                     end
                 else
                     EndOfBandRun = EndOfBandRun - 1
+                end
+
+                for v = 1, 64, 1 do
+                    Copy[v] = BlockData[v]
                 end
 
             end
@@ -659,15 +681,14 @@ function InterpretMarker(Buff) --handles calling functions to decode markers
         print("DNL")
         ReadDNL(Buff)
     elseif (Marker ~= 0) then --0xFF00 is a padding byte
-        local len = Buff:ReadLBytes(2) - 2 --skip marker
-        print(len, Marker)
+        local Len = Buff:ReadLBytes(2) - 2 --skip marker
+
         if (SOF2 < Marker and Marker <= 0xCF) then
             print("Unsupported frame:", Marker)
             os.exit(1)
         end
-        for i = 1, len, 1 do
-            Buff:ReadLBytes(1)
-        end
+
+        Buff:ReadLBytes(Len)
     end
 
 end
@@ -694,6 +715,54 @@ function TransformMCUs()
 
         end
         MapMCU(MCUs[m], m-1)
+    end
+
+end
+
+function TransformBlocks()
+
+    for c, info in pairs(ComponantsInfo) do
+        local NumComponantBlocks = #Blocks[c]
+        local QuantizationTable = QuantizationTables[info.QuantizationTableDestination+1]
+
+        --un-zigzag, dequantize and IDCT
+        for i = 1, NumComponantBlocks, 1 do
+            local DecodedBlock = Blocks[c][i]
+            local Block = {}
+            for v = 1, 64, 1 do
+                Block[v] = DecodedBlock[ZigZag[v]] * QuantizationTable[ZigZag[v]]
+            end
+            Blocks[c][i] = IDCT(Block)
+        end
+
+        --upsample and map to pixel matrix
+        local XScale = HMax // info.HorizontalSamplingFactor
+        local YScale = VMax // info.VerticalSamplingFactor
+        local SubImageX = XScale * 8
+        local SubImageY = YScale * 8
+
+        for yb = 1, Blocks[c].Y, 1 do
+            for xb = 1, Blocks[c].X, 1 do
+                local BlockIndex = (yb-1) * Blocks[c].X + xb
+                local Block = Blocks[c][BlockIndex]
+
+                local HorizontalEdge = math.min(SubImageY, (Y - ((yb-1) * SubImageY)))
+
+                for y = 1, HorizontalEdge, 1 do
+                    local VerticalEdge = math.min(SubImageX, (X - ((xb-1) * SubImageX)))
+                    for x = 1, VerticalEdge, 1 do
+                        local ImageYIndex = (yb - 1) * SubImageY + (y - 1)
+                        local ImageXIndex = (xb - 1) * SubImageX + (x - 1)
+                        local BlockYIndex = (y - 1) // YScale
+                        local BlockXIndex = (x - 1) // XScale
+
+                        Pixels[c][ImageYIndex * X + ImageXIndex + 1] = Block[BlockYIndex * 8 + BlockXIndex + 1]
+                    end
+                end
+
+            end
+        end
+
     end
 
 end
@@ -732,6 +801,8 @@ function DecodeJpeg(FileName)
 
     TransformMCUs()
     YCbCrToRGB()
+    -- TransformBlocks()
+    -- YCbCrToRGB()
 
     ImageInfo.X = X
     ImageInfo.Y = Y
@@ -754,7 +825,7 @@ function DecodeJpeg(FileName)
 end
 
 local S = os.clock()
-local ImageInfo = DecodeJpeg("yae.jpg")
+local ImageInfo = DecodeJpeg("Space.jpg")
 -- tiger.jpg seems to assume the use of default huffman tables, which technically isn't standards compliant
 print("Decoding time:", os.clock() - S)
 
