@@ -117,16 +117,16 @@ function YCbCrToRGB()
 end
 
 function ReadQuantizationTables(Buff)
-    local Length = Buff:ReadLBytes(2) - 2 --length bytes are counted in the length of chunk
+    local Length = Buff:ReadBytes(2) - 2 --length bytes are counted in the length of chunk
 
     while (Length > 0) do --there may be multiple quantization tables in one block
-        local Precision = Buff:ReadLBits(4) == 0 and 1 or 2
-        local Tq = Buff:ReadLBits(4)
+        local Precision = Buff:ReadBits(4) == 0 and 1 or 2
+        local Tq = Buff:ReadBits(4)
         local QuantizationTable = {}
         Length = Length - 1
 
         for v = 1, 64, 1 do
-            QuantizationTable[v] = Buff:ReadLBytes(Precision)
+            QuantizationTable[v] = Buff:ReadBytes(Precision)
         end
 
         Length = Length - Precision * 64
@@ -136,24 +136,24 @@ function ReadQuantizationTables(Buff)
 end
 
 function ReadHuffmanTable(Buff)
-    local Length = Buff:ReadLBytes(2) - 2
+    local Length = Buff:ReadBytes(2) - 2
 
     while (Length > 0) do
-        local TableClass = Buff:ReadLBits(4)
-        local Dest = Buff:ReadLBits(4)
+        local TableClass = Buff:ReadBits(4)
+        local Dest = Buff:ReadBits(4)
         local CodeLengths = {}
         local GeneratedHuffmanCodes = HuffmanTree.New()
         local CurrentCode = 0
 
         for i = 1, 16, 1 do
-            CodeLengths[i] = Buff:ReadLBytes(1)
+            CodeLengths[i] = Buff:ReadBytes(1)
         end
 
         Length = Length - 17
 
         for i = 1, 16, 1 do --generating huffman codes from length frequencies
             for j = 1, CodeLengths[i], 1 do
-                local Value = Buff:ReadLBytes(1)
+                local Value = Buff:ReadBytes(1)
                 GeneratedHuffmanCodes:AddCode(CurrentCode, i, Value)
                 CurrentCode = CurrentCode + 1
             end
@@ -167,46 +167,46 @@ function ReadHuffmanTable(Buff)
 end
 
 function ReadJFIFHeader(Buff)
-    local Length = Buff:ReadLBytes(2)
-    local Identfier = Buff:ReadLBytes(5)
+    local Length = Buff:ReadBytes(2)
+    local Identfier = Buff:ReadBytes(5)
 
     if (Identfier ~= 0x4A46494600) then --skip the thumbnail chunk if present
-        Buff:ReadLBytes(Length - 7)
+        Buff:ReadBytes(Length - 7)
         return
     end
 
-    local Version = Buff:ReadLBytes(2)
-    local Density = Buff:ReadLBytes(1)
+    local Version = Buff:ReadBytes(2)
+    local Density = Buff:ReadBytes(1)
 
-    local XDensity = Buff:ReadLBytes(2)
-    local YDensity = Buff:ReadLBytes(2)
+    local XDensity = Buff:ReadBytes(2)
+    local YDensity = Buff:ReadBytes(2)
 
-    local XThumbnail = Buff:ReadLBytes(1)
-    local YThumbnail = Buff:ReadLBytes(1)
+    local XThumbnail = Buff:ReadBytes(1)
+    local YThumbnail = Buff:ReadBytes(1)
 
-    Buff:ReadLBytes(XThumbnail * YThumbnail) -- skip thumbnail data
+    Buff:ReadBytes(XThumbnail * YThumbnail) -- skip thumbnail data
 
     print(XDensity, YDensity, Density, Version)
 end
 
 function ReadFrame(Buff)
-    local Length = Buff:ReadLBytes(2)
-    local Precision = Buff:ReadLBytes(1)
+    local Length = Buff:ReadBytes(2)
+    local Precision = Buff:ReadBytes(1)
 
     SamplePrecision = Precision
 
-    Y = Buff:ReadLBytes(2)
-    X = Buff:ReadLBytes(2)
+    Y = Buff:ReadBytes(2)
+    X = Buff:ReadBytes(2)
 
-    local ComponantsInFrame = Buff:ReadLBytes(1)
+    local ComponantsInFrame = Buff:ReadBytes(1)
 
     for i = 1, ComponantsInFrame, 1 do
-        local Identifier = Buff:ReadLBytes(1)
+        local Identifier = Buff:ReadBytes(1)
 
         local Componant = {
-            HorizontalSamplingFactor = Buff:ReadLBits(4),
-            VerticalSamplingFactor = Buff:ReadLBits(4),
-            QuantizationTableDestination = Buff:ReadLBytes(1)
+            HorizontalSamplingFactor = Buff:ReadBits(4),
+            VerticalSamplingFactor = Buff:ReadBits(4),
+            QuantizationTableDestination = Buff:ReadBytes(1)
         }
 
         if (Componant.HorizontalSamplingFactor > HMax) then
@@ -223,11 +223,12 @@ function ReadFrame(Buff)
 
     --initializing blocks
     for p, c in pairs(ComponantsInfo) do
-        --formulas adapted from the specification
-        --may have extra blocks from expanding caused by sampling factors when image is small, so need to clamp to the sampling factors
+        -- may have extra blocks from expanding caused by sampling factors (encoder may enforce
+        -- componant dimensions to be a multiple of the sampling factors and pad blocks) 
+        -- (ONLY SOMETIMES), may be ommitted as well depending on the encoder (seriously, wtf)
+        -- "solved" by making a temp block if indexed block is nil while reading scan
         local BlocksXDim = math.max(c.HorizontalSamplingFactor, math.ceil(math.ceil(X * c.HorizontalSamplingFactor / HMax) / 8))
         local BlocksYDim = math.max(c.VerticalSamplingFactor, math.ceil(math.ceil(Y * c.VerticalSamplingFactor / VMax) / 8))
-
         Blocks[p] = {}
         Blocks[p].X = BlocksXDim
         Blocks[p].Y = BlocksYDim
@@ -249,7 +250,7 @@ function IndexHuffmanTree(Tree, Buff)
     local Current = Tree.Root
 
     while (Current.Value == nil) do
-        Current = Current[Buff:ReadLBit()]
+        Current = Current[Buff:ReadBit()]
     end
 
     return Current.Value
@@ -286,7 +287,6 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
     else
         local Comp = Blocks[ComponantParameters[1].ScanComponantIndex]
         TotalMCUs = Comp.X * Comp.Y
-        print(Comp.X, Comp.Y)
     end
 
     for i = 1, ComponantsInScan, 1 do
@@ -313,22 +313,41 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                 local BlockData
                 local K = Ss + 1
 
+                -- finding block index and dealing with edge case
+                local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
+                local BlocksYDim = Blocks[ComponantParams.ScanComponantIndex].Y
+
                 if (ComponantsInScan > 1) then
                     local MCUYIndex = (MCU-1) // MCUXDim
                     local MCUXIndex = (MCU-1) - MCUYIndex * MCUXDim
                     local BlockY = MCUYIndex * ComponantInfo.VerticalSamplingFactor + (c-1) // ComponantInfo.HorizontalSamplingFactor
                     local BlockX = MCUXIndex * ComponantInfo.HorizontalSamplingFactor + ((c-1) % ComponantInfo.HorizontalSamplingFactor) + 1
-                    local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
-                    BlockData = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+
+                    if (BlockX <= BlocksXDim and BlockY <= BlocksYDim) then
+                        BlockData = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+                    end
                 else
-                    BlockData = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                    local MCUYIndex = (MCU-1) // BlocksXDim
+                    local MCUXIndex = (MCU-1) - MCUYIndex * BlocksXDim
+
+                    if (MCUXIndex <= BlocksXDim and MCUYIndex <= BlocksYDim) then
+                        BlockData = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                    end
+                end
+
+                --problem when padding blocks are added by some encoders, worked around by creating temp blocks to throw away padding
+                if (BlockData == nil) then
+                    BlockData = {}
+                    for v = 1, 64, 1 do
+                        BlockData[v] = 0
+                    end
                 end
 
                 if (EndOfBandRun == 0) then
 
                     if (Ss == 0) then
                         local T = IndexHuffmanTree(DCHuffmanTree, Buff)
-                        local DIFF = Extend(Buff:ReadLBits(T), T) + PreviousDCCoefficients[i]
+                        local DIFF = Extend(Buff:ReadBits(T), T) + PreviousDCCoefficients[i]
                         PreviousDCCoefficients[i] = DIFF
 
                         BlockData[K] = BlockData[K] + DIFF * (1 << Al)
@@ -345,7 +364,7 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                             if (HigherNibble == 15) then
                                 K = K + 16
                             else
-                                EndOfBandRun = (1 << HigherNibble) + Buff:ReadLBits(HigherNibble) - 1
+                                EndOfBandRun = (1 << HigherNibble) + Buff:ReadBits(HigherNibble) - 1
                                 break
                             end
 
@@ -353,7 +372,7 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
 
                             K = K + HigherNibble
 
-                            BlockData[K] = BlockData[K] + Extend(Buff:ReadLBits(LowerNibble), LowerNibble) * (1 << Al)
+                            BlockData[K] = BlockData[K] + Extend(Buff:ReadBits(LowerNibble), LowerNibble) * (1 << Al)
                             K = K + 1
 
                         end
@@ -367,7 +386,7 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
 
         if (RestartInterval ~= 0 and MCU % RestartInterval == 0) then
             Buff:Align()
-            local Marker = Buff:ReadLBytes(2)
+            local Marker = Buff:ReadBytes(2)
 
             if (Marker ~= RSTnMin + ((RestartInterval // RestartInterval) % 8)) then
                 print("Restart Marker error, got marker", Marker, "expected", 0xFFD0 + ((RestartInterval // RestartInterval) % 8))
@@ -416,8 +435,6 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
         TotalMCUs = Comp.X * Comp.Y
     end
 
-    print("refinement scan", Al, Ah, Ss, Se, ComponantsInScan)
-
     for MCU = 1, TotalMCUs, 1 do
         for i = 1, ComponantsInScan, 1 do
             local ComponantParams = ComponantParameters[i]
@@ -435,21 +452,40 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                 local BlockData
                 local K = Ss + 1
 
+                -- finding block index and dealing with edge case
+                local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
+                local BlocksYDim = Blocks[ComponantParams.ScanComponantIndex].Y
+
                 if (ComponantsInScan > 1) then
                     local MCUYIndex = (MCU-1) // MCUXDim
                     local MCUXIndex = (MCU-1) - MCUYIndex * MCUXDim
                     local BlockY = MCUYIndex * ComponantInfo.VerticalSamplingFactor + (c-1) // ComponantInfo.HorizontalSamplingFactor
                     local BlockX = MCUXIndex * ComponantInfo.HorizontalSamplingFactor + ((c-1) % ComponantInfo.HorizontalSamplingFactor) + 1
-                    local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
-                    BlockData = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+
+                    if (BlockX <= BlocksXDim and BlockY <= BlocksYDim) then
+                        BlockData = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+                    end
                 else
-                    BlockData = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                    local MCUYIndex = (MCU-1) // BlocksXDim
+                    local MCUXIndex = (MCU-1) - MCUYIndex * BlocksXDim
+
+                    if (MCUXIndex <= BlocksXDim and MCUYIndex <= BlocksYDim) then
+                        BlockData = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                    end
+                end
+
+                --problem when padding blocks are added by some encoders
+                if (BlockData == nil) then
+                    BlockData = {}
+                    for v = 1, 64, 1 do
+                        BlockData[v] = 0
+                    end
                 end
 
                 if (EndOfBandRun <= 0) then
 
                     if (Ss == 0) then
-                        local Bit = Buff:ReadLBit()
+                        local Bit = Buff:ReadBit()
 
                         if (BlockData[K] == 0) then
                             BlockData[K] = (Bit == 0 and Negative or Positive)
@@ -472,7 +508,7 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
 
                                 while (Skip > 0 and K <= Se+1) do
                                     if (BlockData[K] ~= 0) then
-                                        BlockData[K] = BlockData[K] + Buff:ReadLBit() * (BlockData[K] < 0 and Negative or Positive)
+                                        BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
                                     else
                                         Skip = Skip - 1
                                     end
@@ -480,11 +516,11 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                                 end
 
                             else
-                                EndOfBandRun = (1 << HigherNibble) + Buff:ReadLBits(HigherNibble) - 1
+                                EndOfBandRun = (1 << HigherNibble) + Buff:ReadBits(HigherNibble) - 1
 
                                 while (K <= Se + 1) do
                                     if (BlockData[K] ~= 0) then
-                                        BlockData[K] = BlockData[K] + Buff:ReadLBit() * (BlockData[K] < 0 and Negative or Positive)
+                                        BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
                                     end
                                     K = K + 1
                                 end
@@ -495,13 +531,13 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                         else
 
                             local Skip = HigherNibble
-                            local Sign = Buff:ReadLBits(LowerNibble) == 1 and 1 or -1
+                            local Sign = Buff:ReadBits(LowerNibble) == 1 and 1 or -1
 
                             while ((Skip > 0 or BlockData[K] ~= 0) and K <= Se+1) do
                                 -- need to pass a minimumm of skip coeffecients, but must continue to skip until a 0 value is found to place the new AC coefficent
                                 -- this took A WEEK to figure out
                                 if (BlockData[K] ~= 0) then
-                                    BlockData[K] = BlockData[K] + Buff:ReadLBit() * (BlockData[K] < 0 and Negative or Positive)
+                                    BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
                                 else
                                     Skip = Skip - 1
                                 end
@@ -518,7 +554,7 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                 else
                      while (K <= Se + 1) do
                         if (BlockData[K] ~= 0) then
-                            BlockData[K] = BlockData[K] + (Buff:ReadLBit() << Al) * (BlockData[K] < 0 and -1 or 1)
+                            BlockData[K] = BlockData[K] + (Buff:ReadBit() << Al) * (BlockData[K] < 0 and -1 or 1)
                         end
                         K = K + 1
                     end
@@ -530,7 +566,7 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
 
         if (RestartInterval ~= 0 and MCU % RestartInterval == 0) then
             Buff:Align()
-            local Marker = Buff:ReadLBytes(2)
+            local Marker = Buff:ReadBytes(2)
 
             if (Marker ~= RSTnMin + ((RestartInterval // RestartInterval) % 8)) then
                 print("Restart Marker error, got marker", Marker, "expected", 0xFFD0 + ((RestartInterval // RestartInterval) % 8))
@@ -544,25 +580,25 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
 end
 
 function ReadScan(Buff)
-    local Length = Buff:ReadLBytes(2)
-    local ComponantsInScan = Buff:ReadLBytes(1)
+    local Length = Buff:ReadBytes(2)
+    local ComponantsInScan = Buff:ReadBytes(1)
     local ComponantParameters = {}
 
     for i = 1, ComponantsInScan, 1 do
         local Parameters = {
-            ScanComponantIndex = Buff:ReadLBytes(1),
-            DCTableIndex = Buff:ReadLBits(4),
-            ACTableIndex = Buff:ReadLBits(4)
+            ScanComponantIndex = Buff:ReadBytes(1),
+            DCTableIndex = Buff:ReadBits(4),
+            ACTableIndex = Buff:ReadBits(4)
         }
 
         ComponantParameters[i] = Parameters
     end
 
-    local Ss = Buff:ReadLBytes(1) -- start of spectral selection
-    local Se = Buff:ReadLBytes(1) -- end of spectral selection
+    local Ss = Buff:ReadBytes(1) -- start of spectral selection
+    local Se = Buff:ReadBytes(1) -- end of spectral selection
 
-    local Ah = Buff:ReadLBits(4) -- successive approximation high
-    local Al = Buff:ReadLBits(4) -- successive approximation low
+    local Ah = Buff:ReadBits(4) -- successive approximation high
+    local Al = Buff:ReadBits(4) -- successive approximation low
 
     if (Ah == 0) then --clean up scan code later...
         ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters)
@@ -574,17 +610,17 @@ function ReadScan(Buff)
 end
 
 function ReadRestartInterval(Buff)
-    local Length = Buff:ReadLBytes(2)
-    RestartInterval = Buff:ReadLBytes(2) --number of MCU in the restart interval
+    local Length = Buff:ReadBytes(2)
+    RestartInterval = Buff:ReadBytes(2) --number of MCU in the restart interval
 end
 
 function ReadDNL(Buff)
-    local Length = Buff:ReadLBytes(2)
-    local NumLines = Buff:ReadLBytes(2)
+    local Length = Buff:ReadBytes(2)
+    local NumLines = Buff:ReadBytes(2)
 end
 
 function InterpretMarker(Buff) --handles calling functions to decode markers
-    local Marker = Buff:ReadLBytes(1)
+    local Marker = Buff:ReadBytes(1)
 
     if (Marker == DQT) then
         print("Define Quantization Tables")
@@ -614,14 +650,14 @@ function InterpretMarker(Buff) --handles calling functions to decode markers
         print("DNL")
         ReadDNL(Buff)
     elseif (Marker ~= 0) then --0xFF00 is a padding byte
-        local Len = Buff:ReadLBytes(2) - 2 --skip marker
+        local Len = Buff:ReadBytes(2) - 2 --skip marker
 
         if (SOF2 < Marker and Marker <= 0xCF) then
             print("Unsupported frame:", Marker)
             os.exit(1)
         end
 
-        Buff:ReadLBytes(Len)
+        Buff:ReadBytes(Len)
     end
 
 end
@@ -677,7 +713,7 @@ end
 function DecodeJpeg(FileName)
     local Buff = Buffer.New(FileName)
 
-    if (Buff:ReadLBytes(2) ~= 0xFFD8) then print("inavlid jpg file") return end
+    if (Buff:ReadBytes(2) ~= 0xFFD8) then print("inavlid jpg file") return end
 
     local ImageInfo = {
         X = X,
@@ -695,7 +731,7 @@ function DecodeJpeg(FileName)
     }
 
     while (not Buff:IsEmpty()) do
-        local Byte = Buff:ReadLBytes(1)
+        local Byte = Buff:ReadBytes(1)
         if (Byte == 0xFF) then
             local R = InterpretMarker(Buff)
 
@@ -706,8 +742,6 @@ function DecodeJpeg(FileName)
         end
     end
 
-    -- TransformMCUs()
-    -- YCbCrToRGB()
     TransformBlocks()
     YCbCrToRGB()
 
@@ -732,7 +766,8 @@ function DecodeJpeg(FileName)
 end
 
 local S = os.clock()
-local ImageInfo = DecodeJpeg("yae.jpg")
+local ImageInfo = DecodeJpeg("jpegtest.jpg")
+
 print("Decoding time:", os.clock() - S)
 
 function WritePPM(File, Length, Width)
