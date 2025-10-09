@@ -36,19 +36,6 @@ local ZigZag = {
     36, 37, 49, 50, 58, 59, 63, 64
 }
 
---Tables and Info to decode image data
-local QuantizationTables = {{}, {}, {}, {}}
-local ACHuffmanCodes = {{}, {}, {}, {}}
-local DCHuffmanCodes = {{}, {}, {}, {}}
-local ComponantsInfo = {}
-local HMax = 0 -- max horizontal sampling factor
-local VMax = 0 -- max vertical sampling factor
-local X = 0
-local Y = 0
-local SamplePrecision = 0
-local RestartInterval = 0
-local Blocks = {}
-local Pixels = {}
 local CosMap = {}
 
 for i = 0, 7, 1 do
@@ -60,7 +47,7 @@ end
 
 local Time = 0
 
-function IDCT(Data) --optimize this later
+function IDCT(Data, SamplePrecision) --optimize this later
     local Start = os.clock()
     local Result = {}
     local InvSqrt2 = 1 / math.sqrt(2)
@@ -87,9 +74,9 @@ function IDCT(Data) --optimize this later
     return Result
 end
 
-function YCbCrToRGB()
-
-    local Offset = SamplePrecision > 0 and 1 << (SamplePrecision - 1) or 1
+function YCbCrToRGB(ImageInfo)
+    local Pixels = ImageInfo.Pixels
+    local Offset = ImageInfo.SamplePrecision > 0 and 1 << (ImageInfo.SamplePrecision - 1) or 1
     local Max = Offset * 2 - 1
 
     local function Clamp(x)
@@ -98,9 +85,9 @@ function YCbCrToRGB()
         return x
     end
 
-    for i = 1, Y, 1 do
-        for j = 1, X, 1 do
-            local Index = (i-1) * X + j
+    for i = 1, ImageInfo.Y, 1 do
+        for j = 1, ImageInfo.X, 1 do
+            local Index = (i-1) * ImageInfo.X + j
             local y = Pixels[1][Index] or Offset
             local Cb = Pixels[2][Index] or Offset
             local Cr = Pixels[3][Index] or Offset
@@ -116,7 +103,7 @@ function YCbCrToRGB()
     end
 end
 
-function ReadQuantizationTables(Buff)
+function ReadQuantizationTables(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2) - 2 --length bytes are counted in the length of chunk
 
     while (Length > 0) do --there may be multiple quantization tables in one block
@@ -130,12 +117,12 @@ function ReadQuantizationTables(Buff)
         end
 
         Length = Length - Precision * 64
-        QuantizationTables[Tq + 1] = QuantizationTable
+        ImageInfo.QuantizationTables[Tq + 1] = QuantizationTable
     end
 
 end
 
-function ReadHuffmanTable(Buff)
+function ReadHuffmanTable(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2) - 2
 
     while (Length > 0) do
@@ -161,7 +148,12 @@ function ReadHuffmanTable(Buff)
             CurrentCode = CurrentCode << 1
         end
 
-        (TableClass == 1 and ACHuffmanCodes or DCHuffmanCodes)[Dest + 1] = GeneratedHuffmanCodes --didnt know I could use the ternary operator like this lol
+        if (TableClass == 1) then
+            ImageInfo.ACHuffmanCodes[Dest + 1] = GeneratedHuffmanCodes
+        else
+            ImageInfo.DCHuffmanCodes[Dest + 1] = GeneratedHuffmanCodes
+        end
+
     end
 
 end
@@ -189,14 +181,16 @@ function ReadJFIFHeader(Buff)
     print(XDensity, YDensity, Density, Version)
 end
 
-function ReadFrame(Buff)
+function ReadFrame(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2)
     local Precision = Buff:ReadBytes(1)
 
-    SamplePrecision = Precision
+    ImageInfo.SamplePrecision = Precision
 
-    Y = Buff:ReadBytes(2)
-    X = Buff:ReadBytes(2)
+    ImageInfo.Y = Buff:ReadBytes(2)
+    ImageInfo.X = Buff:ReadBytes(2)
+    ImageInfo.HMax = 1
+    ImageInfo.VMax = 1
 
     local ComponantsInFrame = Buff:ReadBytes(1)
 
@@ -209,29 +203,28 @@ function ReadFrame(Buff)
             QuantizationTableDestination = Buff:ReadBytes(1)
         }
 
-        if (Componant.HorizontalSamplingFactor > HMax) then
-            HMax = Componant.HorizontalSamplingFactor
+        if (Componant.HorizontalSamplingFactor > ImageInfo.HMax) then
+            ImageInfo.HMax = Componant.HorizontalSamplingFactor
         end
 
-        if (Componant.VerticalSamplingFactor > VMax) then
-            VMax = Componant.VerticalSamplingFactor
+        if (Componant.VerticalSamplingFactor > ImageInfo.VMax) then
+            ImageInfo.VMax = Componant.VerticalSamplingFactor
         end
 
-        ComponantsInfo[Identifier] = Componant
-        Pixels[i] = {}
+        ImageInfo.ComponantsInfo[Identifier] = Componant
+        ImageInfo.Pixels[i] = {}
     end
 
     --initializing blocks
-    for p, c in pairs(ComponantsInfo) do
-        -- may have extra blocks from expanding caused by sampling factors (encoder may enforce
-        -- componant dimensions to be a multiple of the sampling factors and pad blocks) 
-        -- (ONLY SOMETIMES), may be ommitted as well depending on the encoder (seriously, wtf)
-        -- "solved" by making a temp block if indexed block is nil while reading scan
-        local BlocksXDim = math.max(c.HorizontalSamplingFactor, math.ceil(math.ceil(X * c.HorizontalSamplingFactor / HMax) / 8))
-        local BlocksYDim = math.max(c.VerticalSamplingFactor, math.ceil(math.ceil(Y * c.VerticalSamplingFactor / VMax) / 8))
-        Blocks[p] = {}
-        Blocks[p].X = BlocksXDim
-        Blocks[p].Y = BlocksYDim
+    for p, c in pairs(ImageInfo.ComponantsInfo) do
+        -- may have extra blocks from expanding caused by sampling factors (encoder may enforce componant dimensions to be a 
+        -- multiple of the sampling factors and pad blocks). (ONLY SOMETIMES), may be ommitted as well depending on the encoder,
+        -- solved by storing extra blocks so that the componant's dimensions are multiples of their respective sampling factors
+        local BlocksXDim = math.ceil((math.ceil(ImageInfo.X / 8) * (c.HorizontalSamplingFactor / ImageInfo.HMax)) / c.HorizontalSamplingFactor) * c.HorizontalSamplingFactor
+        local BlocksYDim = math.ceil((math.ceil(ImageInfo.Y / 8) *  (c.VerticalSamplingFactor / ImageInfo.VMax)) / c.VerticalSamplingFactor) * c.VerticalSamplingFactor
+        ImageInfo.Blocks[p] = {}
+        ImageInfo.Blocks[p].X = BlocksXDim
+        ImageInfo.Blocks[p].Y = BlocksYDim
 
         local NumComponantBlocks = BlocksXDim * BlocksYDim
         for i = 1, NumComponantBlocks, 1 do
@@ -239,11 +232,11 @@ function ReadFrame(Buff)
             for v = 1, 64, 1 do
                 Block[v] = 0
             end
-            Blocks[p][i] = Block
+            ImageInfo.Blocks[p][i] = Block
         end
     end
 
-    print("Size:", X, Y, ComponantsInFrame, HMax, VMax)
+    print("Size:", ImageInfo.X, ImageInfo.Y, ComponantsInFrame, ImageInfo.HMax, ImageInfo.VMax)
 end
 
 function IndexHuffmanTree(Tree, Buff)
@@ -261,15 +254,16 @@ function Extend(V, T) -- Extend function as defined in the Jpeg spec (ITU T.81)
     return V < (1 << (T - 1)) and V - (1 << T) + 1 or V
 end
 
-function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters) --handles basline and initial scans of progressive jpegs
+function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo) --handles basline and initial scans of progressive jpegs
     local PreviousDCCoefficients = {}
+    local RestartInterval = ImageInfo.RestartInterval
 
     local ScanHMax = 1
     local ScanVMax = 1
 
     for i = 1, ComponantsInScan, 1 do
         local ComponantParams = ComponantParameters[1]
-        local ComponantInfo = ComponantsInfo[ComponantParams.ScanComponantIndex]
+        local ComponantInfo = ImageInfo.ComponantsInfo[ComponantParams.ScanComponantIndex]
         if (ComponantInfo.HorizontalSamplingFactor > ScanHMax) then
             ScanHMax = ComponantInfo.HorizontalSamplingFactor
         end
@@ -279,14 +273,16 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
         end
     end
 
-    local MCUXDim = math.ceil(X / (8 * ScanHMax))
-    local MCUYDim = math.ceil(Y / (8 * ScanVMax))
+    local MCUXDim = math.ceil(ImageInfo.X / (8 * ScanHMax))
+    local MCUYDim = math.ceil(ImageInfo.Y / (8 * ScanVMax))
 
     if (ComponantsInScan > 1) then
         TotalMCUs = MCUXDim * MCUYDim
     else
-        local Comp = Blocks[ComponantParameters[1].ScanComponantIndex]
-        TotalMCUs = Comp.X * Comp.Y
+        local CInfo = ImageInfo.ComponantsInfo[ComponantParameters[1].ScanComponantIndex]
+        -- not sure if the dimension calculations for blocks work 100% of the time
+        TotalMCUs = math.max(CInfo.HorizontalSamplingFactor, math.ceil(math.ceil(ImageInfo.X * CInfo.HorizontalSamplingFactor / ImageInfo.HMax) / 8)) *
+                    math.max(CInfo.VerticalSamplingFactor, math.ceil(math.ceil(ImageInfo.Y * CInfo.VerticalSamplingFactor / ImageInfo.VMax) / 8))
     end
 
     for i = 1, ComponantsInScan, 1 do
@@ -298,9 +294,9 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
     for MCU = 1, TotalMCUs, 1 do
         for i = 1, ComponantsInScan, 1 do
             local ComponantParams = ComponantParameters[i]
-            local ComponantInfo = ComponantsInfo[ComponantParams.ScanComponantIndex]
-            local ACHuffmanTree = ACHuffmanCodes[ComponantParams.ACTableIndex + 1]
-            local DCHuffmanTree = DCHuffmanCodes[ComponantParams.DCTableIndex + 1]
+            local ComponantInfo = ImageInfo.ComponantsInfo[ComponantParams.ScanComponantIndex]
+            local ACHuffmanTree = ImageInfo.ACHuffmanCodes[ComponantParams.ACTableIndex + 1]
+            local DCHuffmanTree = ImageInfo.DCHuffmanCodes[ComponantParams.DCTableIndex + 1]
 
             local NumComponantBlocks = ComponantsInScan > 1 and ComponantInfo.HorizontalSamplingFactor * ComponantInfo.VerticalSamplingFactor or 1
 
@@ -314,8 +310,8 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                 local K = Ss + 1
 
                 -- finding block index and dealing with edge case
-                local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
-                local BlocksYDim = Blocks[ComponantParams.ScanComponantIndex].Y
+                local BlocksXDim = ImageInfo.Blocks[ComponantParams.ScanComponantIndex].X
+                local BlocksYDim = ImageInfo.Blocks[ComponantParams.ScanComponantIndex].Y
 
                 if (ComponantsInScan > 1) then
                     local MCUYIndex = (MCU-1) // MCUXDim
@@ -324,14 +320,14 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                     local BlockX = MCUXIndex * ComponantInfo.HorizontalSamplingFactor + ((c-1) % ComponantInfo.HorizontalSamplingFactor) + 1
 
                     if (BlockX <= BlocksXDim and BlockY <= BlocksYDim) then
-                        BlockData = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+                        BlockData = ImageInfo.Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
                     end
                 else
                     local MCUYIndex = (MCU-1) // BlocksXDim
                     local MCUXIndex = (MCU-1) - MCUYIndex * BlocksXDim
 
                     if (MCUXIndex <= BlocksXDim and MCUYIndex <= BlocksYDim) then
-                        BlockData = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                        BlockData = ImageInfo.Blocks[ComponantParams.ScanComponantIndex][MCU]
                     end
                 end
 
@@ -384,12 +380,15 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
             end
         end
 
-        if (RestartInterval ~= 0 and MCU % RestartInterval == 0) then
+        -- note: restart marker is skipped if we finished decoding all MCUs
+        if (RestartInterval ~= 0 and MCU % RestartInterval == 0 and MCU ~= TotalMCUs) then
             Buff:Align()
+
+            local ExpextedMarker = 0xFF00 + RSTnMin + (((MCU - RestartInterval) // RestartInterval) % 8)
             local Marker = Buff:ReadBytes(2)
 
-            if (Marker ~= RSTnMin + ((RestartInterval // RestartInterval) % 8)) then
-                print("Restart Marker error, got marker", Marker, "expected", 0xFFD0 + ((RestartInterval // RestartInterval) % 8))
+            if (Marker ~= ExpextedMarker) then
+                print("Restart Marker error, got marker", Marker, "expected", ExpextedMarker)
                 return
             end
 
@@ -404,18 +403,19 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
 
 end
 
-function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters)
+function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo)
     local TotalMCUs
     local EndOfBandRun = 0
     local Positive = 1 << Al
     local Negative = -1 * Positive
+    local RestartInterval = ImageInfo.RestartInterval
 
     local ScanHMax = 1
     local ScanVMax = 1
 
     for i = 1, ComponantsInScan, 1 do
         local ComponantParams = ComponantParameters[1]
-        local ComponantInfo = ComponantsInfo[ComponantParams.ScanComponantIndex]
+        local ComponantInfo = ImageInfo.ComponantsInfo[ComponantParams.ScanComponantIndex]
         if (ComponantInfo.HorizontalSamplingFactor > ScanHMax) then
             ScanHMax = ComponantInfo.HorizontalSamplingFactor
         end
@@ -425,21 +425,22 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
         end
     end
 
-    local MCUXDim = math.ceil(X / (8 * ScanHMax))
-    local MCUYDim = math.ceil(Y / (8 * ScanVMax))
+    local MCUXDim = math.ceil(ImageInfo.X / (8 * ScanHMax))
+    local MCUYDim = math.ceil(ImageInfo.Y / (8 * ScanVMax))
 
     if (ComponantsInScan > 1) then
         TotalMCUs = MCUXDim * MCUYDim
     else
-        local Comp = Blocks[ComponantParameters[1].ScanComponantIndex]
-        TotalMCUs = Comp.X * Comp.Y
+        local Info = ImageInfo.ComponantsInfo[ComponantParameters[1].ScanComponantIndex]
+        TotalMCUs = math.max(Info.HorizontalSamplingFactor, math.ceil(math.ceil(ImageInfo.X * Info.HorizontalSamplingFactor / ImageInfo.HMax) / 8)) *
+                    math.max(Info.VerticalSamplingFactor, math.ceil(math.ceil(ImageInfo.Y * Info.VerticalSamplingFactor / ImageInfo.VMax) / 8))
     end
 
     for MCU = 1, TotalMCUs, 1 do
         for i = 1, ComponantsInScan, 1 do
             local ComponantParams = ComponantParameters[i]
-            local ComponantInfo = ComponantsInfo[ComponantParams.ScanComponantIndex]
-            local ACHuffmanTree = ACHuffmanCodes[ComponantParams.ACTableIndex + 1]
+            local ComponantInfo = ImageInfo.ComponantsInfo[ComponantParams.ScanComponantIndex]
+            local ACHuffmanTree = ImageInfo.ACHuffmanCodes[ComponantParams.ACTableIndex + 1]
 
             local NumComponantBlocks = ComponantsInScan > 1 and ComponantInfo.HorizontalSamplingFactor * ComponantInfo.VerticalSamplingFactor or 1
 
@@ -453,8 +454,8 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                 local K = Ss + 1
 
                 -- finding block index and dealing with edge case
-                local BlocksXDim = Blocks[ComponantParams.ScanComponantIndex].X
-                local BlocksYDim = Blocks[ComponantParams.ScanComponantIndex].Y
+                local BlocksXDim = ImageInfo.Blocks[ComponantParams.ScanComponantIndex].X
+                local BlocksYDim = ImageInfo.Blocks[ComponantParams.ScanComponantIndex].Y
 
                 if (ComponantsInScan > 1) then
                     local MCUYIndex = (MCU-1) // MCUXDim
@@ -463,14 +464,14 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                     local BlockX = MCUXIndex * ComponantInfo.HorizontalSamplingFactor + ((c-1) % ComponantInfo.HorizontalSamplingFactor) + 1
 
                     if (BlockX <= BlocksXDim and BlockY <= BlocksYDim) then
-                        BlockData = Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
+                        BlockData = ImageInfo.Blocks[ComponantParams.ScanComponantIndex][BlockY * BlocksXDim + BlockX]
                     end
                 else
                     local MCUYIndex = (MCU-1) // BlocksXDim
                     local MCUXIndex = (MCU-1) - MCUYIndex * BlocksXDim
 
                     if (MCUXIndex <= BlocksXDim and MCUYIndex <= BlocksYDim) then
-                        BlockData = Blocks[ComponantParams.ScanComponantIndex][MCU]
+                        BlockData = ImageInfo.Blocks[ComponantParams.ScanComponantIndex][MCU]
                     end
                 end
 
@@ -564,12 +565,14 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
             end
         end
 
-        if (RestartInterval ~= 0 and MCU % RestartInterval == 0) then
+        if (ImageInfo.RestartInterval ~= 0 and MCU % ImageInfo.RestartInterval == 0 and MCU ~= TotalMCUs) then
             Buff:Align()
+
+            local ExpextedMarker = 0xFF00 + RSTnMin + (((MCU - RestartInterval) // RestartInterval) % 8)
             local Marker = Buff:ReadBytes(2)
 
-            if (Marker ~= RSTnMin + ((RestartInterval // RestartInterval) % 8)) then
-                print("Restart Marker error, got marker", Marker, "expected", 0xFFD0 + ((RestartInterval // RestartInterval) % 8))
+            if (Marker ~= ExpextedMarker) then
+                print("Restart Marker error, got marker", Marker, "expected", ExpextedMarker)
                 return
             end
 
@@ -579,7 +582,7 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
     end
 end
 
-function ReadScan(Buff)
+function ReadScan(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2)
     local ComponantsInScan = Buff:ReadBytes(1)
     local ComponantParameters = {}
@@ -601,17 +604,17 @@ function ReadScan(Buff)
     local Al = Buff:ReadBits(4) -- successive approximation low
 
     if (Ah == 0) then --clean up scan code later...
-        ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters)
+        ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo)
     else
         print("reading refinement")
-        ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters)
+        ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo)
     end
 
 end
 
-function ReadRestartInterval(Buff)
+function ReadRestartInterval(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2)
-    RestartInterval = Buff:ReadBytes(2) --number of MCU in the restart interval
+    ImageInfo.RestartInterval = Buff:ReadBytes(2) --number of MCU in the restart interval
 end
 
 function ReadDNL(Buff)
@@ -619,28 +622,32 @@ function ReadDNL(Buff)
     local NumLines = Buff:ReadBytes(2)
 end
 
-function InterpretMarker(Buff) --handles calling functions to decode markers
+local ScanTime = 0
+
+function InterpretMarker(Buff, ImageInfo) --handles calling functions to decode markers
     local Marker = Buff:ReadBytes(1)
 
     if (Marker == DQT) then
         print("Define Quantization Tables")
-        ReadQuantizationTables(Buff)
+        ReadQuantizationTables(Buff, ImageInfo)
     elseif (Marker == DHT) then
-        ReadHuffmanTable(Buff)
+        ReadHuffmanTable(Buff, ImageInfo)
         print("Define Huffman Tables")
     elseif (Marker == JFIFHeader) then
         print("JFIF header")
         ReadJFIFHeader(Buff)
     elseif (Marker == SOF0 or Marker == SOF1 or Marker == SOF2) then
         print("Start of frame (baseline DCT or progressive DCT)")
-        ReadFrame(Buff)
+        ReadFrame(Buff, ImageInfo)
     elseif (Marker == SOS) then
         print("Start of scan")
-        ReadScan(Buff)
+        local s = os.clock()
+        ReadScan(Buff, ImageInfo)
+        ScanTime = ScanTime + (os.clock() - s)
         Buff:Align()
     elseif (Marker == DRI) then
         print("restart len")
-        ReadRestartInterval(Buff)
+        ReadRestartInterval(Buff, ImageInfo)
     elseif (Marker == EOI) then
         return -1
     elseif (Marker == DAC) then
@@ -662,45 +669,51 @@ function InterpretMarker(Buff) --handles calling functions to decode markers
 
 end
 
-function TransformBlocks()
+function TransformBlocks(ImageInfo)
 
-    for c, info in pairs(ComponantsInfo) do
-        local NumComponantBlocks = #Blocks[c]
-        local QuantizationTable = QuantizationTables[info.QuantizationTableDestination+1]
+    local Blocks = ImageInfo.Blocks
+    local Pixels = ImageInfo.Pixels
+    local X = ImageInfo.X
+    local Y = ImageInfo.Y
 
-        --un-zigzag, dequantize and IDCT
-        for i = 1, NumComponantBlocks, 1 do
-            local DecodedBlock = Blocks[c][i]
-            local Block = {}
-            for v = 1, 64, 1 do
-                Block[v] = DecodedBlock[ZigZag[v]] * QuantizationTable[ZigZag[v]]
-            end
-            Blocks[c][i] = IDCT(Block)
-        end
-
-        --upsample and map to pixel matrix
-        local XScale = HMax // info.HorizontalSamplingFactor
-        local YScale = VMax // info.VerticalSamplingFactor
+    for c, info in pairs(ImageInfo.ComponantsInfo) do
+        local QuantizationTable = ImageInfo.QuantizationTables[info.QuantizationTableDestination+1]
+        local XScale = ImageInfo.HMax // info.HorizontalSamplingFactor
+        local YScale = ImageInfo.VMax // info.VerticalSamplingFactor
         local SubImageX = XScale * 8
         local SubImageY = YScale * 8
 
         for yb = 1, Blocks[c].Y, 1 do
             for xb = 1, Blocks[c].X, 1 do
-                local BlockIndex = (yb-1) * Blocks[c].X + xb
-                local Block = Blocks[c][BlockIndex]
+                --un-zigzag, dequantize and IDCT
+                local BlockIndex = (yb - 1) * Blocks[c].X + xb
+                local DecodedBlock = Blocks[c][BlockIndex]
+                local Block = {}
 
+                for v = 1, 64, 1 do
+                    Block[v] = DecodedBlock[ZigZag[v]] * QuantizationTable[ZigZag[v]]
+                end
+
+                Block = IDCT(Block, ImageInfo.SamplePrecision)
+                --upsample and map to pixel matrix
                 local HorizontalEdge = math.min(SubImageY, (Y - ((yb - 1) * SubImageY)))
+                local ImageYIndex = (yb - 1) * SubImageY * X
+                local ImageXIndex = (xb - 1) * SubImageX
 
                 for y = 1, HorizontalEdge, 1 do
                     local VerticalEdge = math.min(SubImageX, (X - ((xb - 1) * SubImageX)))
+                    local BlockYIndex = (y - 1) // YScale
+
                     for x = 1, VerticalEdge, 1 do
-                        local ImageYIndex = (yb - 1) * SubImageY + (y - 1)
-                        local ImageXIndex = (xb - 1) * SubImageX + (x - 1)
-                        local BlockYIndex = (y - 1) // YScale
                         local BlockXIndex = (x - 1) // XScale
 
-                        Pixels[c][ImageYIndex * X + ImageXIndex + 1] = Block[BlockYIndex * 8 + BlockXIndex + 1]
+                        Pixels[c][ImageYIndex + ImageXIndex + 1] = Block[BlockYIndex * 8 + BlockXIndex + 1]
+
+                        ImageXIndex = ImageXIndex + 1
                     end
+
+                    ImageXIndex = ImageXIndex - VerticalEdge
+                    ImageYIndex = ImageYIndex + X
                 end
 
             end
@@ -713,12 +726,12 @@ end
 function DecodeJpeg(FileName)
     local Buff = Buffer.New(FileName)
 
-    if (Buff:ReadBytes(2) ~= 0xFFD8) then print("inavlid jpg file") return end
+    if (Buff:ReadBytes(2) ~= (0xFF << 8) + SOI) then print("inavlid jpg file") return end
 
     local ImageInfo = {
-        X = X,
-        Y = Y,
-        Pixels = Pixels,
+        X = 0,
+        Y = 0,
+        Pixels = {},
         QuantizationTables = {{}, {}, {}, {}},
         DCHuffmanCodes = {{}, {}, {}, {}},
         ACHuffmanCodes = {{}, {}, {}, {}},
@@ -727,13 +740,13 @@ function DecodeJpeg(FileName)
         VMax = 0,
         SamplePrecision = 0,
         RestartInterval = 0,
-        Blocks = {},
+        Blocks = {}
     }
 
     while (not Buff:IsEmpty()) do
         local Byte = Buff:ReadBytes(1)
         if (Byte == 0xFF) then
-            local R = InterpretMarker(Buff)
+            local R = InterpretMarker(Buff, ImageInfo)
 
             if (R == -1) then
                 break
@@ -742,31 +755,14 @@ function DecodeJpeg(FileName)
         end
     end
 
-    TransformBlocks()
-    YCbCrToRGB()
-
-    ImageInfo.X = X
-    ImageInfo.Y = Y
-
-    --reset tables/data used for decoding
-    QuantizationTables = {{}, {}, {}, {}}
-    DCHuffmanCodes = {{}, {}, {}, {}}
-    ACHuffmanCodes = {{}, {}, {}, {}}
-    ComponantsInfo = {}
-    X = 0
-    Y = 0
-    HMax = 0
-    VMax = 0
-    SamplePrecision = 0
-    RestartInterval = 0
-    MCUs = {}
-    Pixels = {}
+    TransformBlocks(ImageInfo)
+    YCbCrToRGB(ImageInfo)
 
     return ImageInfo
 end
 
 local S = os.clock()
-local ImageInfo = DecodeJpeg("jpegtest.jpg")
+local ImageInfo = DecodeJpeg("Yae.jpg")
 
 print("Decoding time:", os.clock() - S)
 
@@ -789,5 +785,6 @@ end
 WritePPM(io.open("t.ppm", "w"), ImageInfo.Y, ImageInfo.X)
 
 print("IDCT time:", Time)
+print("Scan time:", ScanTime)
 
 return DecodeJpeg
