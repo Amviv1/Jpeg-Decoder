@@ -1,5 +1,6 @@
 local Buffer = require("BitBuffer")
 local HuffmanTree = require("HuffmanTree")
+local IDCT = require("IDCT")
 
 --markers:
 local SOI = 0xD8 -- start of image
@@ -36,47 +37,9 @@ local ZigZag = {
     36, 37, 49, 50, 58, 59, 63, 64
 }
 
-local CosMap = {}
-
-for i = 0, 7, 1 do
-    CosMap[i] = {}
-    for j = 0, 7, 1 do
-        CosMap[i][j] = math.cos((2 * i + 1) * j * math.pi / 16)
-    end
-end
-
-local Time = 0
-
-function IDCT(Data, SamplePrecision) --optimize this later
-    local Start = os.clock()
-    local Result = {}
-    local InvSqrt2 = 1 / math.sqrt(2)
-    local Offset = SamplePrecision > 0 and 1 << (SamplePrecision - 1) or 1
-
-    for y = 0, 7, 1 do
-        for x = 0, 7, 1 do
-
-            local S = 0
-
-            for u = 0, 7, 1 do
-                for v = 0, 7, 1 do
-                    S = S + (u == 0 and InvSqrt2 or 1) * (v == 0 and InvSqrt2 or 1) * Data[u * 8 + v + 1] * CosMap[x][u] * CosMap[y][v]
-                end
-            end
-
-            Result[x * 8 + y + 1] = S / 4 + Offset
-
-        end
-    end
-
-    Time = Time + (os.clock() - Start)
-
-    return Result
-end
-
 function YCbCrToRGB(ImageInfo)
     local Pixels = ImageInfo.Pixels
-    local Offset = ImageInfo.SamplePrecision > 0 and 1 << (ImageInfo.SamplePrecision - 1) or 1
+    local Offset = ImageInfo.SamplePrecision > 0 and 1 << (ImageInfo.SamplePrecision - 1) or 0
     local Max = Offset * 2 - 1
 
     local function Clamp(x)
@@ -85,12 +48,13 @@ function YCbCrToRGB(ImageInfo)
         return x
     end
 
+    local Index = 1
+
     for i = 1, ImageInfo.Y, 1 do
         for j = 1, ImageInfo.X, 1 do
-            local Index = (i-1) * ImageInfo.X + j
-            local y = Pixels[1][Index] or Offset
-            local Cb = Pixels[2][Index] or Offset
-            local Cr = Pixels[3][Index] or Offset
+            local y = Pixels[1][Index]
+            local Cb = Pixels[2][Index]
+            local Cr = Pixels[3][Index]
 
             local R = Clamp(y + 1.402 * (Cr - Offset))
             local G = Clamp(y - 0.34414 * (Cb - Offset) - 0.71414 * (Cr - Offset))
@@ -99,6 +63,8 @@ function YCbCrToRGB(ImageInfo)
             Pixels[1][Index] = math.floor(R + 0.5)
             Pixels[2][Index] = math.floor(G + 0.5)
             Pixels[3][Index] = math.floor(B + 0.5)
+
+            Index = Index + 1
         end
     end
 end
@@ -106,7 +72,7 @@ end
 function ReadQuantizationTables(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2) - 2 --length bytes are counted in the length of chunk
 
-    while (Length > 0) do --there may be multiple quantization tables in one block
+    while (Length > 0) do --there may be multiple quantization tables in one chunk
         local Precision = Buff:ReadBits(4) == 0 and 1 or 2
         local Tq = Buff:ReadBits(4)
         local QuantizationTable = {}
@@ -125,7 +91,7 @@ end
 function ReadHuffmanTable(Buff, ImageInfo)
     local Length = Buff:ReadBytes(2) - 2
 
-    while (Length > 0) do
+    while (Length > 0) do -- may have multiple huffman tables in one chunk
         local TableClass = Buff:ReadBits(4)
         local Dest = Buff:ReadBits(4)
         local CodeLengths = {}
@@ -219,9 +185,9 @@ function ReadFrame(Buff, ImageInfo)
     for p, c in pairs(ImageInfo.ComponantsInfo) do
         -- may have extra blocks from expanding caused by sampling factors (encoder may enforce componant dimensions to be a 
         -- multiple of the sampling factors and pad blocks). (ONLY SOMETIMES), may be ommitted as well depending on the encoder,
-        -- solved by storing extra blocks so that the componant's dimensions are multiples of their respective sampling factors
-        local BlocksXDim = math.ceil((math.ceil(ImageInfo.X / 8) * (c.HorizontalSamplingFactor / ImageInfo.HMax)) / c.HorizontalSamplingFactor) * c.HorizontalSamplingFactor
-        local BlocksYDim = math.ceil((math.ceil(ImageInfo.Y / 8) *  (c.VerticalSamplingFactor / ImageInfo.VMax)) / c.VerticalSamplingFactor) * c.VerticalSamplingFactor
+        -- solved by making 'temporary' blocks within scans when the MCU is outisde of image bounds
+        local BlocksXDim = math.ceil(math.ceil(ImageInfo.X / 8) * (c.HorizontalSamplingFactor / ImageInfo.HMax))
+        local BlocksYDim = math.ceil(math.ceil(ImageInfo.Y / 8) * (c.VerticalSamplingFactor / ImageInfo.VMax))
         ImageInfo.Blocks[p] = {}
         ImageInfo.Blocks[p].X = BlocksXDim
         ImageInfo.Blocks[p].Y = BlocksYDim
@@ -254,10 +220,7 @@ function Extend(V, T) -- Extend function as defined in the Jpeg spec (ITU T.81)
     return V < (1 << (T - 1)) and V - (1 << T) + 1 or V
 end
 
-function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo) --handles basline and initial scans of progressive jpegs
-    local PreviousDCCoefficients = {}
-    local RestartInterval = ImageInfo.RestartInterval
-
+function ScanDimensions(ComponantsInScan, ComponantParameters, ImageInfo)
     local ScanHMax = 1
     local ScanVMax = 1
 
@@ -275,6 +238,7 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
 
     local MCUXDim = math.ceil(ImageInfo.X / (8 * ScanHMax))
     local MCUYDim = math.ceil(ImageInfo.Y / (8 * ScanVMax))
+    local TotalMCUs
 
     if (ComponantsInScan > 1) then
         TotalMCUs = MCUXDim * MCUYDim
@@ -285,11 +249,18 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                     math.max(CInfo.VerticalSamplingFactor, math.ceil(math.ceil(ImageInfo.Y * CInfo.VerticalSamplingFactor / ImageInfo.VMax) / 8))
     end
 
+    return MCUXDim, TotalMCUs
+end
+
+function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo) --handles basline and spectral scans in progressive jpegs
+    local MCUXDim, TotalMCUs = ScanDimensions(ComponantsInScan, ComponantParameters, ImageInfo)
+    local RestartInterval = ImageInfo.RestartInterval
+    local PreviousDCCoefficients = {}
+    local EndOfBandRun = 0
+
     for i = 1, ComponantsInScan, 1 do
         PreviousDCCoefficients[i] = 0
     end
-
-    local EndOfBandRun = 0
 
     for MCU = 1, TotalMCUs, 1 do
         for i = 1, ComponantsInScan, 1 do
@@ -300,12 +271,15 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
 
             local NumComponantBlocks = ComponantsInScan > 1 and ComponantInfo.HorizontalSamplingFactor * ComponantInfo.VerticalSamplingFactor or 1
 
-            if ((ACHuffmanTree.Root == nil and Se > 0) or (DCHuffmanTree.Root == nil and Ss == 0)) then
-                print("undefined AC/DC huffman tree")
-                os.exit(1)
-            end
-
             for c = 1, NumComponantBlocks, 1 do
+                if (EndOfBandRun > 0 and EndOfBandRun - (NumComponantBlocks - c + 1) >= 0) then
+                    EndOfBandRun = EndOfBandRun - (NumComponantBlocks - c + 1)
+                    break
+                else
+                    c = c + EndOfBandRun
+                    EndOfBandRun = 0
+                end
+
                 local BlockData
                 local K = Ss + 1
 
@@ -331,50 +305,39 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
                     end
                 end
 
-                --problem when padding blocks are added by some encoders, worked around by creating temp blocks to throw away padding
                 if (BlockData == nil) then
                     BlockData = {}
-                    for v = 1, 64, 1 do
-                        BlockData[v] = 0
+                    for l = 1, 64, 1 do
+                        BlockData[l] = 0
                     end
                 end
 
-                if (EndOfBandRun == 0) then
+                if (Ss == 0) then
+                    local T = IndexHuffmanTree(DCHuffmanTree, Buff)
+                    local DIFF = Extend(Buff:ReadBits(T), T) + PreviousDCCoefficients[i]
+                    PreviousDCCoefficients[i] = DIFF
 
-                    if (Ss == 0) then
-                        local T = IndexHuffmanTree(DCHuffmanTree, Buff)
-                        local DIFF = Extend(Buff:ReadBits(T), T) + PreviousDCCoefficients[i]
-                        PreviousDCCoefficients[i] = DIFF
+                    BlockData[K] = BlockData[K] + DIFF * (1 << Al)
+                    K = K + 1
+                end
 
-                        BlockData[K] = BlockData[K] + DIFF * (1 << Al)
+                while (K <= Se + 1) do
+                    local RS = IndexHuffmanTree(ACHuffmanTree, Buff)
+                    local LowerNibble = RS & 0xF
+                    local HigherNibble = RS >> 4
+
+                    if (LowerNibble == 0) then
+                        if (HigherNibble == 15) then
+                            K = K + 16
+                        else
+                            EndOfBandRun = (1 << HigherNibble) + Buff:ReadBits(HigherNibble) - 1
+                            break
+                        end
+                    else
+                        K = K + HigherNibble
+                        BlockData[K] = BlockData[K] + Extend(Buff:ReadBits(LowerNibble), LowerNibble) * (1 << Al)
                         K = K + 1
                     end
-
-                    while (K <= Se + 1) do
-                        local RS = IndexHuffmanTree(ACHuffmanTree, Buff)
-                        local LowerNibble = RS & 0xF
-                        local HigherNibble = RS >> 4
-
-                        if (LowerNibble == 0) then
-
-                            if (HigherNibble == 15) then
-                                K = K + 16
-                            else
-                                EndOfBandRun = (1 << HigherNibble) + Buff:ReadBits(HigherNibble) - 1
-                                break
-                            end
-
-                        else
-
-                            K = K + HigherNibble
-
-                            BlockData[K] = BlockData[K] + Extend(Buff:ReadBits(LowerNibble), LowerNibble) * (1 << Al)
-                            K = K + 1
-
-                        end
-                    end
-                else
-                    EndOfBandRun = EndOfBandRun - 1
                 end
 
             end
@@ -404,37 +367,12 @@ function ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParam
 end
 
 function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo)
-    local TotalMCUs
     local EndOfBandRun = 0
+    local RestartInterval = ImageInfo.RestartInterval
     local Positive = 1 << Al
     local Negative = -1 * Positive
-    local RestartInterval = ImageInfo.RestartInterval
 
-    local ScanHMax = 1
-    local ScanVMax = 1
-
-    for i = 1, ComponantsInScan, 1 do
-        local ComponantParams = ComponantParameters[1]
-        local ComponantInfo = ImageInfo.ComponantsInfo[ComponantParams.ScanComponantIndex]
-        if (ComponantInfo.HorizontalSamplingFactor > ScanHMax) then
-            ScanHMax = ComponantInfo.HorizontalSamplingFactor
-        end
-
-        if (ComponantInfo.VerticalSamplingFactor > ScanVMax) then
-            ScanVMax = ComponantInfo.VerticalSamplingFactor
-        end
-    end
-
-    local MCUXDim = math.ceil(ImageInfo.X / (8 * ScanHMax))
-    local MCUYDim = math.ceil(ImageInfo.Y / (8 * ScanVMax))
-
-    if (ComponantsInScan > 1) then
-        TotalMCUs = MCUXDim * MCUYDim
-    else
-        local Info = ImageInfo.ComponantsInfo[ComponantParameters[1].ScanComponantIndex]
-        TotalMCUs = math.max(Info.HorizontalSamplingFactor, math.ceil(math.ceil(ImageInfo.X * Info.HorizontalSamplingFactor / ImageInfo.HMax) / 8)) *
-                    math.max(Info.VerticalSamplingFactor, math.ceil(math.ceil(ImageInfo.Y * Info.VerticalSamplingFactor / ImageInfo.VMax) / 8))
-    end
+    local MCUXDim, TotalMCUs = ScanDimensions(ComponantsInScan, ComponantParameters, ImageInfo)
 
     for MCU = 1, TotalMCUs, 1 do
         for i = 1, ComponantsInScan, 1 do
@@ -444,12 +382,8 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
 
             local NumComponantBlocks = ComponantsInScan > 1 and ComponantInfo.HorizontalSamplingFactor * ComponantInfo.VerticalSamplingFactor or 1
 
-            if (ACHuffmanTree.Root == nil and Se > 0) then
-                print("undefined AC huffman tree")
-                os.exit(1)
-            end
-
             for c = 1, NumComponantBlocks, 1 do
+
                 local BlockData
                 local K = Ss + 1
 
@@ -475,68 +409,36 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                     end
                 end
 
-                --problem when padding blocks are added by some encoders
                 if (BlockData == nil) then
                     BlockData = {}
-                    for v = 1, 64, 1 do
-                        BlockData[v] = 0
+                    for l = 1, 64, 1 do
+                        BlockData[l] = 0
                     end
+                 end
+
+                if (Ss == 0 and EndOfBandRun == 0) then
+                    local Bit = Buff:ReadBit()
+
+                    if (BlockData[K] == 0) then
+                        BlockData[K] = (Bit == 0 and Negative or Positive)
+                    else
+                        BlockData[K] = BlockData[K] + (BlockData[K] < 0 and Negative or Positive)
+                    end
+
+                    K = K + 1
+                    if (Se ~= 0) then print("invalid refinement scan, DC and AC coeffecients are mixed") os.exit(1) end
                 end
 
-                if (EndOfBandRun <= 0) then
+                while (K <= Se + 1 and EndOfBandRun == 0) do
+                    local RS = IndexHuffmanTree(ACHuffmanTree, Buff)
+                    local LowerNibble = RS & 0xF
+                    local HigherNibble = RS >> 4
 
-                    if (Ss == 0) then
-                        local Bit = Buff:ReadBit()
+                    if (LowerNibble == 0) then
+                        if (HigherNibble == 15) then
+                            local Skip = 16
 
-                        if (BlockData[K] == 0) then
-                            BlockData[K] = (Bit == 0 and Negative or Positive)
-                        else
-                            BlockData[K] = BlockData[K] + (BlockData[K] < 0 and Negative or Positive)
-                        end
-
-                        K = K + 1
-                        if (Se ~= 0) then print("invalid refinement scan, DC and AC coeffecients are mixed") os.exit(1) end
-                    end
-
-                    while (K <= Se + 1) do
-                        local RS = IndexHuffmanTree(ACHuffmanTree, Buff)
-                        local LowerNibble = RS & 0xF
-                        local HigherNibble = RS >> 4
-
-                        if (LowerNibble == 0) then
-                            if (HigherNibble == 15) then
-                                local Skip = 16
-
-                                while (Skip > 0 and K <= Se+1) do
-                                    if (BlockData[K] ~= 0) then
-                                        BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
-                                    else
-                                        Skip = Skip - 1
-                                    end
-                                    K = K + 1
-                                end
-
-                            else
-                                EndOfBandRun = (1 << HigherNibble) + Buff:ReadBits(HigherNibble) - 1
-
-                                while (K <= Se + 1) do
-                                    if (BlockData[K] ~= 0) then
-                                        BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
-                                    end
-                                    K = K + 1
-                                end
-
-                                break
-                            end
-
-                        else
-
-                            local Skip = HigherNibble
-                            local Sign = Buff:ReadBits(LowerNibble) == 1 and 1 or -1
-
-                            while ((Skip > 0 or BlockData[K] ~= 0) and K <= Se+1) do
-                                -- need to pass a minimumm of skip coeffecients, but must continue to skip until a 0 value is found to place the new AC coefficent
-                                -- this took A WEEK to figure out
+                            while (Skip > 0 and K <= Se+1) do
                                 if (BlockData[K] ~= 0) then
                                     BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
                                 else
@@ -545,15 +447,33 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
                                 K = K + 1
                             end
 
-                            if (K > Se + 1) then break end
-
-                            BlockData[K] = BlockData[K] + Sign * (1 << Al)
-                            K = K + 1
-
+                        else
+                            EndOfBandRun = (1 << HigherNibble) + Buff:ReadBits(HigherNibble)
+                            break
                         end
+                    else
+                        local Skip = HigherNibble
+                        local Sign = Buff:ReadBits(LowerNibble) == 1 and 1 or -1
+
+                        while ((Skip > 0 or BlockData[K] ~= 0) and K <= Se+1) do
+                            -- need to pass a minimumm of skip coeffecients, but must continue to skip until a 0 value is found to place the new AC coefficent
+                            if (BlockData[K] ~= 0) then
+                                BlockData[K] = BlockData[K] + Buff:ReadBit() * (BlockData[K] < 0 and Negative or Positive)
+                            else
+                                Skip = Skip - 1
+                            end
+                            K = K + 1
+                        end
+
+                        if (K > Se + 1) then break end
+
+                        BlockData[K] = BlockData[K] + Sign * (1 << Al)
+                        K = K + 1
                     end
-                else
-                     while (K <= Se + 1) do
+                end
+
+                if (EndOfBandRun > 0) then
+                    while (K <= Se + 1) do
                         if (BlockData[K] ~= 0) then
                             BlockData[K] = BlockData[K] + (Buff:ReadBit() << Al) * (BlockData[K] < 0 and -1 or 1)
                         end
@@ -565,6 +485,7 @@ function ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantPar
             end
         end
 
+        -- note: restart marker is skipped if we finished decoding all MCUs
         if (ImageInfo.RestartInterval ~= 0 and MCU % ImageInfo.RestartInterval == 0 and MCU ~= TotalMCUs) then
             Buff:Align()
 
@@ -694,14 +615,20 @@ function TransformBlocks(ImageInfo)
                     Block[v] = DecodedBlock[ZigZag[v]] * QuantizationTable[ZigZag[v]]
                 end
 
-                Block = IDCT(Block, ImageInfo.SamplePrecision)
+                IDCT(Block)
+
+                local Offset = ImageInfo.SamplePrecision > 0 and 1 << (ImageInfo.SamplePrecision - 1) or 0
+                for v = 1, 64, 1 do
+                    Block[v] = Block[v] + Offset
+                end
+
                 --upsample and map to pixel matrix
                 local HorizontalEdge = math.min(SubImageY, (Y - ((yb - 1) * SubImageY)))
+                local VerticalEdge = math.min(SubImageX, (X - ((xb - 1) * SubImageX)))
                 local ImageYIndex = (yb - 1) * SubImageY * X
                 local ImageXIndex = (xb - 1) * SubImageX
 
                 for y = 1, HorizontalEdge, 1 do
-                    local VerticalEdge = math.min(SubImageX, (X - ((xb - 1) * SubImageX)))
                     local BlockYIndex = (y - 1) // YScale
 
                     for x = 1, VerticalEdge, 1 do
@@ -726,7 +653,7 @@ end
 function DecodeJpeg(FileName)
     local Buff = Buffer.New(FileName)
 
-    if (Buff:ReadBytes(2) ~= (0xFF << 8) + SOI) then print("inavlid jpg file") return end
+    if (Buff:ReadBytes(2) ~= 0xFF00 + SOI) then print("inavlid jpg file") return end
 
     local ImageInfo = {
         X = 0,
@@ -762,7 +689,7 @@ function DecodeJpeg(FileName)
 end
 
 local S = os.clock()
-local ImageInfo = DecodeJpeg("Yae.jpg")
+local ImageInfo = DecodeJpeg("Penguin.jpg")
 
 print("Decoding time:", os.clock() - S)
 
@@ -784,7 +711,6 @@ end
 
 WritePPM(io.open("t.ppm", "w"), ImageInfo.Y, ImageInfo.X)
 
-print("IDCT time:", Time)
 print("Scan time:", ScanTime)
 
 return DecodeJpeg
