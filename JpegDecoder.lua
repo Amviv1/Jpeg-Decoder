@@ -53,12 +53,12 @@ function YCbCrToRGB(ImageInfo)
     for i = 1, ImageInfo.Y, 1 do
         for j = 1, ImageInfo.X, 1 do
             local y = Pixels[1][Index]
-            local Cb = Pixels[2][Index]
-            local Cr = Pixels[3][Index]
+            local Cb = Pixels[2][Index] - Offset
+            local Cr = Pixels[3][Index] - Offset
 
-            local R = Clamp(y + 1.402 * (Cr - Offset))
-            local G = Clamp(y - 0.34414 * (Cb - Offset) - 0.71414 * (Cr - Offset))
-            local B = Clamp(y + 1.772 * (Cb - Offset))
+            local R = Clamp(y + 1.402 * Cr)
+            local G = Clamp(y - 0.34414 * Cb - 0.71414 * Cr)
+            local B = Clamp(y + 1.772 * Cb)
 
             Pixels[1][Index] = math.floor(R + 0.5)
             Pixels[2][Index] = math.floor(G + 0.5)
@@ -144,7 +144,6 @@ function ReadJFIFHeader(Buff)
 
     Buff:ReadBytes(XThumbnail * YThumbnail) -- skip thumbnail data
 
-    print(XDensity, YDensity, Density, Version)
 end
 
 function ReadFrame(Buff, ImageInfo)
@@ -202,7 +201,6 @@ function ReadFrame(Buff, ImageInfo)
         end
     end
 
-    print("Size:", ImageInfo.X, ImageInfo.Y, ComponantsInFrame, ImageInfo.HMax, ImageInfo.VMax)
 end
 
 function IndexHuffmanTree(Tree, Buff)
@@ -524,10 +522,9 @@ function ReadScan(Buff, ImageInfo)
     local Ah = Buff:ReadBits(4) -- successive approximation high
     local Al = Buff:ReadBits(4) -- successive approximation low
 
-    if (Ah == 0) then --clean up scan code later...
+    if (Ah == 0) then
         ReadSpectralScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo)
     else
-        print("reading refinement")
         ReadRefinementScan(Buff, Ss, Se, Al, Ah, ComponantsInScan, ComponantParameters, ImageInfo)
     end
 
@@ -543,31 +540,21 @@ function ReadDNL(Buff)
     local NumLines = Buff:ReadBytes(2)
 end
 
-local ScanTime = 0
-
 function InterpretMarker(Buff, ImageInfo) --handles calling functions to decode markers
     local Marker = Buff:ReadBytes(1)
 
     if (Marker == DQT) then
-        print("Define Quantization Tables")
         ReadQuantizationTables(Buff, ImageInfo)
     elseif (Marker == DHT) then
         ReadHuffmanTable(Buff, ImageInfo)
-        print("Define Huffman Tables")
     elseif (Marker == JFIFHeader) then
-        print("JFIF header")
         ReadJFIFHeader(Buff)
     elseif (Marker == SOF0 or Marker == SOF1 or Marker == SOF2) then
-        print("Start of frame (baseline DCT or progressive DCT)")
         ReadFrame(Buff, ImageInfo)
     elseif (Marker == SOS) then
-        print("Start of scan")
-        local s = os.clock()
         ReadScan(Buff, ImageInfo)
-        ScanTime = ScanTime + (os.clock() - s)
         Buff:Align()
     elseif (Marker == DRI) then
-        print("restart len")
         ReadRestartInterval(Buff, ImageInfo)
     elseif (Marker == EOI) then
         return -1
@@ -575,8 +562,9 @@ function InterpretMarker(Buff, ImageInfo) --handles calling functions to decode 
         print("Arithmetic encoding is not supported")
         os.exit(1)
     elseif (Marker == DNL) then
-        print("DNL")
         ReadDNL(Buff)
+        print("DNL currently unsupported")
+        os.exit(1)
     elseif (Marker ~= 0) then --0xFF00 is a padding byte
         local Len = Buff:ReadBytes(2) - 2 --skip marker
 
@@ -687,30 +675,5 @@ function DecodeJpeg(FileName)
 
     return ImageInfo
 end
-
-local S = os.clock()
-local ImageInfo = DecodeJpeg("Penguin.jpg")
-
-print("Decoding time:", os.clock() - S)
-
-function WritePPM(File, Length, Width)
-    File:write("P3\n")
-    File:write(tostring(Width).." "..tostring(Length).."\n")
-    File:write("255\n")
-    for l = 1, Length, 1 do
-        for w = 1, Width, 1 do
-            local Index = (l - 1) * Width + w
-            local R = ImageInfo.Pixels[1][Index]
-            local G = ImageInfo.Pixels[2][Index]
-            local B = ImageInfo.Pixels[3][Index]
-
-            File:write(tostring(R).." "..tostring(G).." "..tostring(B).."\n")
-        end
-    end
-end
-
-WritePPM(io.open("t.ppm", "w"), ImageInfo.Y, ImageInfo.X)
-
-print("Scan time:", ScanTime)
 
 return DecodeJpeg
