@@ -16,7 +16,7 @@ For example Info may have the following values:
 
     X = 2
     Y = 2
-		Pixels = {{255, 255, 255, 255} {0, 0, 0, 0}, {100, 100, 100, 100}}
+	Pixels = {{255, 255, 255, 255} {0, 0, 0, 0}, {100, 100, 100, 100}}
 		
 Pixels[1] is the red values, Pixels[2] is the green values and Pixels[3] is the blue values
 		
